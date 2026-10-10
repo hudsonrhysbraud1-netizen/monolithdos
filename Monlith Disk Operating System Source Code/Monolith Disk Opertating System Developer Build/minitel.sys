@@ -1,0 +1,179 @@
+-- MINITEL.SYS - Minitel network implementation for M-DOS
+-- Provides simplified networking layer
+
+os.minitel = {}
+
+-- Minitel configuration
+local hostname = CONFIG and CONFIG.NETWORK and CONFIG.NETWORK.HOSTNAME or "MDOS-PC"
+local defaultPort = 4096
+local openPorts = {}
+local messageQueue = {}
+
+-- Get the modem if available
+local modem = os.component.getPrimary("modem")
+
+function os.minitel.setHostname(name)
+  hostname = name
+end
+
+function os.minitel.getHostname()
+  return hostname
+end
+
+function os.minitel.open(port)
+  port = port or defaultPort
+  if not modem then
+    return false, "No modem available"
+  end
+  
+  if os.network.open(port) then
+    openPorts[port] = true
+    return true
+  end
+  return false
+end
+
+function os.minitel.close(port)
+  if not modem then
+    return false
+  end
+  
+  if os.network.close(port) then
+    openPorts[port] = nil
+    return true
+  end
+  return false
+end
+
+function os.minitel.broadcast(message, port)
+  port = port or defaultPort
+  if not modem then
+    return false, "No modem available"
+  end
+  
+  local packet = {
+    from = hostname,
+    message = message,
+    timestamp = os.system.uptime()
+  }
+  
+  return os.network.broadcast(port, os.serialize(packet))
+end
+
+function os.minitel.send(address, message, port)
+  port = port or defaultPort
+  if not modem then
+    return false, "No modem available"
+  end
+  
+  local packet = {
+    from = hostname,
+    to = address,
+    message = message,
+    timestamp = os.system.uptime()
+  }
+  
+  return os.network.send(address, port, os.serialize(packet))
+end
+
+function os.minitel.receive(timeout, port)
+  timeout = timeout or 1
+  port = port or defaultPort
+  
+  if not modem then
+    return nil, "No modem available"
+  end
+  
+  -- Check message queue first
+  if #messageQueue > 0 then
+    return table.remove(messageQueue, 1)
+  end
+  
+  -- Wait for network message
+  local eventType, receiver, sender, eventPort, distance, data = os.event.pull(timeout, "modem_message")
+  
+  if not eventType then
+    return nil
+  end
+  
+  if port and eventPort ~= port then
+    return nil
+  end
+  
+  -- Try to deserialize packet
+  local ok, packet = pcall(function()
+    local func = load("return " .. data, "=packet", "t", {})
+    if func then
+      return func()
+    end
+  end)
+  
+  if ok and type(packet) == "table" then
+    return {
+      from = packet.from or sender,
+      message = packet.message or data,
+      sender = sender,
+      port = eventPort,
+      distance = distance,
+      timestamp = packet.timestamp
+    }
+  else
+    -- Raw message
+    return {
+      from = sender,
+      message = data,
+      sender = sender,
+      port = eventPort,
+      distance = distance
+    }
+  end
+end
+
+function os.minitel.listen(port, callback)
+  port = port or defaultPort
+  
+  if not os.minitel.open(port) then
+    return false, "Failed to open port"
+  end
+  
+  while true do
+    local msg = os.minitel.receive(nil, port)
+    if msg then
+      local continue = callback(msg)
+      if continue == false then
+        break
+      end
+    end
+  end
+  
+  os.minitel.close(port)
+  return true
+end
+
+-- Helper function to scan for other Minitel nodes
+function os.minitel.scan(timeout)
+  timeout = timeout or 5
+  local nodes = {}
+  local scanPort = 4097
+  
+  os.minitel.open(scanPort)
+  os.minitel.broadcast("PING", scanPort)
+  
+  local deadline = os.system.uptime() + timeout
+  while os.system.uptime() < deadline do
+    local msg = os.minitel.receive(0.5, scanPort)
+    if msg and msg.message == "PONG" then
+      nodes[msg.from] = {
+        hostname = msg.from,
+        address = msg.sender,
+        distance = msg.distance
+      }
+    end
+  end
+  
+  os.minitel.close(scanPort)
+  return nodes
+end
+
+-- Return success (message will be shown by init.lua)
+return true

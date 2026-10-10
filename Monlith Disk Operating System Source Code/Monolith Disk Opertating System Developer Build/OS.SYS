@@ -1,0 +1,1462 @@
+-- OS.SYS - Core system library for Monolith Disk Operating System (M-DOS)
+-- Version 1.1
+-- All system functions are stored in the global 'os' table
+
+os = {}
+local component = component
+local computer = computer
+
+-- ==================== CASE-INSENSITIVE FILE HELPERS ====================
+local function findCaseInsensitive(proxy, path)
+  -- If path is root, return as-is
+  if path == "/" or path == "" then
+    return "/"
+  end
+  
+  -- Split path into parts
+  local parts = {}
+  for part in path:gmatch("[^/]+") do
+    table.insert(parts, part)
+  end
+  
+  -- Build path incrementally, finding case-insensitive matches
+  local currentPath = ""
+  for i, part in ipairs(parts) do
+    local parentPath = currentPath == "" and "/" or currentPath
+    
+    -- Try exact match first
+    local testPath = currentPath .. "/" .. part
+    if proxy.exists(testPath) then
+      currentPath = testPath
+    else
+      -- Try case-insensitive search
+      local found = false
+      local listing = proxy.list(parentPath)
+      if listing then
+        if type(listing) == "function" then
+          for entry in listing do
+            if entry:upper() == part:upper() then
+              currentPath = currentPath .. "/" .. entry
+              found = true
+              break
+            end
+          end
+        end
+      end
+      
+      if not found then
+        -- Path doesn't exist
+        return nil
+      end
+    end
+  end
+  
+  return currentPath
+end
+
+-- ==================== COMPONENT HELPERS ====================
+os.component = {}
+
+function os.component.get(address, ctype)
+  if not address then return nil end
+  if #address < 36 then
+    for addr in component.list(ctype, true) do
+      if addr:sub(1, #address) == address then
+        return addr
+      end
+    end
+    return nil
+  end
+  return address
+end
+
+function os.component.getPrimary(ctype)
+  local addr = component.list(ctype, true)()
+  if addr then
+    return component.proxy(addr)
+  end
+  return nil
+end
+
+-- ==================== DISPLAY/GPU MODULE ====================
+os.display = {}
+
+local gpu = os.component.getPrimary("gpu")
+local screen = os.component.getPrimary("screen")
+
+os.display.gpu = gpu
+os.display.screen = screen
+os.display.cursorX = 1
+os.display.cursorY = 1
+
+function os.display.clear()
+  if gpu then
+    local w, h = gpu.getResolution()
+    gpu.fill(1, 1, w, h, " ")
+    os.display.cursorX = 1
+    os.display.cursorY = 1
+  end
+end
+
+function os.display.write(text, x, y)
+  if not gpu then return end
+  
+  text = tostring(text)
+  
+  if x and y then
+    os.display.cursorX = x
+    os.display.cursorY = y
+  end
+  
+  -- Make sure cursor position is valid
+  if not os.display.cursorX then os.display.cursorX = 1 end
+  if not os.display.cursorY then os.display.cursorY = 1 end
+  
+  local w, h = gpu.getResolution()
+  
+  for i = 1, #text do
+    local char = text:sub(i, i)
+    
+    if char == "\n" then
+      os.display.cursorY = os.display.cursorY + 1
+      os.display.cursorX = 1
+      if os.display.cursorY > h then
+        gpu.copy(1, 2, w, h - 1, 0, -1)
+        gpu.fill(1, h, w, 1, " ")
+        os.display.cursorY = h
+      end
+    else
+      if os.display.cursorX > w then
+        os.display.cursorX = 1
+        os.display.cursorY = os.display.cursorY + 1
+        if os.display.cursorY > h then
+          gpu.copy(1, 2, w, h - 1, 0, -1)
+          gpu.fill(1, h, w, 1, " ")
+          os.display.cursorY = h
+        end
+      end
+      gpu.set(os.display.cursorX, os.display.cursorY, char)
+      os.display.cursorX = os.display.cursorX + 1
+    end
+  end
+end
+
+function os.display.getResolution()
+  if gpu then
+    return gpu.getResolution()
+  end
+  return 50, 16
+end
+
+function os.display.setResolution(w, h)
+  if gpu then
+    return gpu.setResolution(w, h)
+  end
+  return false
+end
+
+function os.display.setForeground(color)
+  if gpu then
+    return gpu.setForeground(color)
+  end
+end
+
+function os.display.setBackground(color)
+  if gpu then
+    return gpu.setBackground(color)
+  end
+end
+
+-- ==================== KEYBOARD/INPUT MODULE ====================
+os.keyboard = {}
+
+local keyboard = os.component.getPrimary("keyboard")
+os.keyboard.keyboard = keyboard
+
+-- Track modifier key states internally
+local modifierStates = {
+  shift = false,
+  control = false,
+  alt = false
+}
+
+-- Internal function to update modifier states based on events
+function os.keyboard._updateModifiers(eventType, code)
+  -- Make sure code is valid before processing
+  if not code or type(code) ~= "number" then
+    return
+  end
+  
+  if eventType == "key_down" then
+    if code == 0x2A or code == 0x36 then  -- lshift or rshift
+      modifierStates.shift = true
+    elseif code == 0x1D or code == 0x9D then  -- lcontrol or rcontrol
+      modifierStates.control = true
+    elseif code == 0x38 or code == 0xB8 then  -- lalt or ralt
+      modifierStates.alt = true
+    end
+  elseif eventType == "key_up" then
+    if code == 0x2A or code == 0x36 then
+      modifierStates.shift = false
+    elseif code == 0x1D or code == 0x9D then
+      modifierStates.control = false
+    elseif code == 0x38 or code == 0xB8 then
+      modifierStates.alt = false
+    end
+  end
+end
+
+function os.keyboard.isControl(char)
+  return type(char) == "number" and (char < 0x20 or (char >= 0x7F and char <= 0x9F))
+end
+
+function os.keyboard.isShiftDown()
+  return modifierStates.shift
+end
+
+function os.keyboard.isControlDown()
+  return modifierStates.control
+end
+
+function os.keyboard.isAltDown()
+  return modifierStates.alt
+end
+
+-- Fallback: check if a key is currently pressed (for older OC versions)
+function os.keyboard.isKeyDown(code)
+  if keyboard and keyboard.isKeyDown then
+    return keyboard.isKeyDown(code)
+  end
+  return false
+end
+
+-- ==================== TEXT INPUT ====================
+-- Standardized text input with cursor and editing support
+function os.keyboard.readLine(options)
+  options = options or {}
+  local maxLength = options.maxLength or 256
+  local showCursor = options.showCursor ~= false
+  local historyTable = options.history
+  local historyPos = 0
+  
+  local line = ""
+  local cursorPos = 0  -- Position is 0-based: 0 means before first char, #line means after last char
+  local startX = os.display.cursorX
+  local startY = os.display.cursorY
+  local w = os.display.getResolution()
+  
+  local function getDisplayText()
+    return options.uppercase and line:upper() or line
+  end
+  
+  local function fullRedraw()
+    -- Clear line
+    os.display.cursorX = startX
+    os.display.cursorY = startY
+    os.display.setBackground(0x000000)
+    os.display.setForeground(0xFFFFFF)
+    
+    -- Clear with spaces
+    local clearWidth = math.min(80, w - startX + 1)
+    for i = 1, clearWidth do
+      os.display.write(" ")
+    end
+    
+    -- Draw text
+    os.display.cursorX = startX
+    os.display.cursorY = startY
+    local displayText = getDisplayText()
+    for i = 1, #displayText do
+      local char = displayText:sub(i, i)
+      if i - 1 == cursorPos and showCursor then
+        -- This is the cursor position
+        os.display.setBackground(0xFFFFFF)
+        os.display.setForeground(0x000000)
+        os.display.write(char)
+        os.display.setBackground(0x000000)
+        os.display.setForeground(0xFFFFFF)
+      else
+        os.display.write(char)
+      end
+    end
+    
+    -- If cursor is at end, draw it as a space
+    if cursorPos >= #line and showCursor then
+      os.display.setBackground(0xFFFFFF)
+      os.display.setForeground(0x000000)
+      os.display.write(" ")
+      os.display.setBackground(0x000000)
+      os.display.setForeground(0xFFFFFF)
+    end
+  end
+  
+  fullRedraw()
+  
+  while true do
+    local eventType, addr, char, code = os.event.pull(nil, "key_down")
+    
+    if eventType then
+      if code == os.keyboard.keys.enter then
+        -- Clear and finalize
+        os.display.cursorX = startX
+        os.display.cursorY = startY
+        os.display.setBackground(0x000000)
+        os.display.setForeground(0xFFFFFF)
+        local clearWidth = math.min(80, w - startX + 1)
+        for i = 1, clearWidth do
+          os.display.write(" ")
+        end
+        os.display.cursorX = startX
+        os.display.cursorY = startY
+        local displayText = getDisplayText()
+        os.display.write(displayText)
+        os.display.write("\n")
+        return line
+        
+      elseif code == os.keyboard.keys.back then
+        if cursorPos > 0 then
+          line = line:sub(1, cursorPos - 1) .. line:sub(cursorPos + 1)
+          cursorPos = cursorPos - 1
+          fullRedraw()
+        end
+        
+      elseif code == os.keyboard.keys.up and historyTable then
+        if historyPos < #historyTable then
+          historyPos = historyPos + 1
+          line = historyTable[#historyTable - historyPos + 1] or ""
+          cursorPos = #line
+          fullRedraw()
+        end
+        
+      elseif code == os.keyboard.keys.down and historyTable then
+        if historyPos > 0 then
+          historyPos = historyPos - 1
+          if historyPos == 0 then
+            line = ""
+          else
+            line = historyTable[#historyTable - historyPos + 1] or ""
+          end
+          cursorPos = #line
+          fullRedraw()
+        end
+        
+      elseif code == os.keyboard.keys.left then
+        if cursorPos > 0 then
+          cursorPos = cursorPos - 1
+          fullRedraw()
+        end
+        
+      elseif code == os.keyboard.keys.right then
+        if cursorPos < #line then
+          cursorPos = cursorPos + 1
+          fullRedraw()
+        end
+        
+      elseif code == os.keyboard.keys.home then
+        cursorPos = 0
+        fullRedraw()
+        
+      elseif code == os.keyboard.keys["end"] then
+        cursorPos = #line
+        fullRedraw()
+        
+      elseif char > 0 and char < 256 and not os.keyboard.isControl(char) then
+        if #line < maxLength then
+          line = line:sub(1, cursorPos) .. string.char(char) .. line:sub(cursorPos + 1)
+          cursorPos = cursorPos + 1
+          fullRedraw()
+        end
+      end
+    end
+  end
+end
+
+-- Key codes (from OpenOS)
+os.keyboard.keys = {
+  ["1"] = 0x02, ["2"] = 0x03, ["3"] = 0x04, ["4"] = 0x05, ["5"] = 0x06,
+  ["6"] = 0x07, ["7"] = 0x08, ["8"] = 0x09, ["9"] = 0x0A, ["0"] = 0x0B,
+  a = 0x1E, b = 0x30, c = 0x2E, d = 0x20, e = 0x12, f = 0x21, g = 0x22,
+  h = 0x23, i = 0x17, j = 0x24, k = 0x25, l = 0x26, m = 0x32, n = 0x31,
+  o = 0x18, p = 0x19, q = 0x10, r = 0x13, s = 0x1F, t = 0x14, u = 0x16,
+  v = 0x2F, w = 0x11, x = 0x2D, y = 0x15, z = 0x2C,
+  enter = 0x1C, back = 0x0E, tab = 0x0F, space = 0x39,
+  lshift = 0x2A, rshift = 0x36, lcontrol = 0x1D, rcontrol = 0x9D,
+  lalt = 0x38, ralt = 0xB8,
+  up = 0xC8, down = 0xD0, left = 0xCB, right = 0xCD,
+  home = 0xC7, ["end"] = 0xCF, pageUp = 0xC9, pageDown = 0xD1,
+}
+
+-- ==================== FILESYSTEM MODULE ====================
+os.fs = {}
+
+local bootfs = component.proxy(computer.getBootAddress())
+os.fs.bootfs = bootfs
+os.fs.drives = {}  -- Drive letter assignments
+os.fs.drives["A"] = bootfs  -- Boot drive is always A:
+os.fs.currentDrive = "A"
+
+function os.fs.setDrive(letter, address)
+  letter = string.upper(letter)
+  if letter == "A" then
+    return false, "Drive A: is reserved for boot disk"
+  end
+  if address then
+    local proxy = component.proxy(address)
+    if proxy then
+      os.fs.drives[letter] = proxy
+      os.fs.saveDriveConfig()
+      return true
+    end
+    return false, "Invalid component address"
+  else
+    os.fs.drives[letter] = nil
+    os.fs.saveDriveConfig()
+    return true
+  end
+end
+
+function os.fs.saveDriveConfig()
+  local config = {}
+  for letter, proxy in pairs(os.fs.drives) do
+    if letter ~= "A" then  -- Don't save boot drive
+      config[letter] = proxy.address
+    end
+  end
+  local data = "return " .. os.serialize(config)
+  local handle = bootfs.open("DRIVES.CFG", "w")
+  if handle then
+    bootfs.write(handle, data)
+    bootfs.close(handle)
+  end
+end
+
+function os.fs.loadDriveConfig()
+  if bootfs.exists("DRIVES.CFG") then
+    local handle = bootfs.open("DRIVES.CFG", "r")
+    if handle then
+      local data = ""
+      repeat
+        local chunk = bootfs.read(handle, math.huge)
+        data = data .. (chunk or "")
+      until not chunk
+      bootfs.close(handle)
+      
+      local func, err = load(data, "=DRIVES.CFG", "t", {})
+      if func then
+        local ok, config = pcall(func)
+        if ok and type(config) == "table" then
+          for letter, address in pairs(config) do
+            os.fs.setDrive(letter, address)
+          end
+        end
+      end
+    end
+  end
+end
+
+function os.fs.getDrive(letter)
+  letter = string.upper(letter)
+  return os.fs.drives[letter]
+end
+
+function os.fs.listDrives()
+  local list = {}
+  for letter, proxy in pairs(os.fs.drives) do
+    table.insert(list, {letter = letter, address = proxy.address})
+  end
+  return list
+end
+
+function os.fs.getCurrentDrive()
+  return os.fs.currentDrive
+end
+
+function os.fs.setCurrentDrive(letter)
+  letter = string.upper(letter)
+  if os.fs.drives[letter] then
+    os.fs.currentDrive = letter
+    return true
+  end
+  return false, "Drive not found"
+end
+
+function os.fs.getCurrentProxy()
+  return os.fs.drives[os.fs.currentDrive] or bootfs
+end
+
+function os.fs.list(path)
+  path = path or "/"
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then
+    return nil, "No filesystem available"
+  end
+  
+  -- Find case-insensitive path
+  local realPath = findCaseInsensitive(proxy, path)
+  if not realPath then
+    return nil, "Path not found"
+  end
+  
+  -- Check if the component is still valid
+  local ok, result = pcall(function()
+    local handle = proxy.list(realPath)
+    if not handle then
+      return nil, "Failed to list directory"
+    end
+    local entries = {}
+    -- proxy.list returns an iterator function, not a table
+    if type(handle) == "function" then
+      for entry in handle do
+        -- Display entries in uppercase
+        table.insert(entries, entry:upper())
+      end
+    else
+      -- In case it returns a table directly
+      for _, entry in ipairs(handle) do
+        table.insert(entries, entry:upper())
+      end
+      return entries
+    end
+    return entries
+  end)
+  
+  if not ok then
+    return nil, "Drive not available"
+  end
+  return result
+end
+
+function os.fs.exists(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false end
+  
+  local realPath = findCaseInsensitive(proxy, path)
+  return realPath ~= nil
+end
+
+function os.fs.isDirectory(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false end
+  
+  local realPath = findCaseInsensitive(proxy, path)
+  if not realPath then return false end
+  
+  local ok, result = pcall(function() return proxy.isDirectory(realPath) end)
+  return ok and result
+end
+
+function os.fs.size(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return 0 end
+  
+  local realPath = findCaseInsensitive(proxy, path)
+  if not realPath then return 0 end
+  
+  local ok, result = pcall(function() return proxy.size(realPath) end)
+  return ok and result or 0
+end
+
+function os.fs.lastModified(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return 0 end
+  
+  local realPath = findCaseInsensitive(proxy, path)
+  if not realPath then return 0 end
+  
+  local ok, result = pcall(function() return proxy.lastModified(realPath) end)
+  return ok and result or 0
+end
+
+function os.fs.remove(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false, "No filesystem available" end
+  
+  local realPath = findCaseInsensitive(proxy, path)
+  if not realPath then return false, "Path not found" end
+  
+  local ok, result = pcall(function() return proxy.remove(realPath) end)
+  if not ok then return false, "Drive not available" end
+  return result
+end
+
+function os.fs.makeDirectory(path)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false, "No filesystem available" end
+  
+  -- For new directories, use path as-is (will be created with exact case)
+  local ok, result = pcall(function() return proxy.makeDirectory(path) end)
+  if not ok then return false, "Drive not available" end
+  return result
+end
+
+function os.fs.rename(from, to)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false, "No filesystem available" end
+  
+  local realFrom = findCaseInsensitive(proxy, from)
+  if not realFrom then return false, "Source not found" end
+  
+  local ok, result = pcall(function() return proxy.rename(realFrom, to) end)
+  if not ok then return false, "Drive not available" end
+  return result
+end
+
+function os.fs.open(path, mode)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return nil, "No filesystem available" end
+  
+  if mode == "r" or mode == "rb" then
+    -- Reading: find case-insensitive
+    local realPath = findCaseInsensitive(proxy, path)
+    if not realPath then return nil, "File not found" end
+    path = realPath
+  end
+  -- Writing: use path as-is
+  
+  local ok, result = pcall(function() return proxy.open(path, mode or "r") end)
+  if not ok then return nil, "Drive not available" end
+  return result
+end
+
+function os.fs.close(handle)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false end
+  local ok, result = pcall(function() return proxy.close(handle) end)
+  return ok and result
+end
+
+function os.fs.read(handle, count)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return nil end
+  local ok, result = pcall(function() return proxy.read(handle, count or math.huge) end)
+  if not ok then return nil end
+  return result
+end
+
+function os.fs.write(handle, data)
+  local proxy = os.fs.getCurrentProxy()
+  if not proxy then return false end
+  local ok, result = pcall(function() return proxy.write(handle, data) end)
+  return ok and result
+end
+
+function os.fs.readAll(path)
+  local handle, reason = os.fs.open(path, "r")
+  if not handle then
+    return nil, reason
+  end
+  local data = ""
+  repeat
+    local chunk = os.fs.read(handle, math.huge)
+    data = data .. (chunk or "")
+  until not chunk
+  os.fs.close(handle)
+  return data
+end
+
+function os.fs.writeAll(path, data)
+  local handle, reason = os.fs.open(path, "w")
+  if not handle then
+    return nil, reason
+  end
+  os.fs.write(handle, data)
+  os.fs.close(handle)
+  return true
+end
+
+-- ==================== NETWORK MODULE ====================
+os.network = {}
+
+local modem = os.component.getPrimary("modem")
+local internet = os.component.getPrimary("internet")
+local tunnel = os.component.getPrimary("tunnel")
+
+os.network.modem = modem
+os.network.internet = internet
+os.network.tunnel = tunnel
+
+function os.network.broadcast(port, ...)
+  if modem then
+    return modem.broadcast(port, ...)
+  end
+  return false
+end
+
+function os.network.send(address, port, ...)
+  if modem then
+    return modem.send(address, port, ...)
+  end
+  return false
+end
+
+function os.network.open(port)
+  if modem then
+    return modem.open(port)
+  end
+  return false
+end
+
+function os.network.close(port)
+  if modem then
+    return modem.close(port)
+  end
+  return false
+end
+
+function os.network.isOpen(port)
+  if modem then
+    return modem.isOpen(port)
+  end
+  return false
+end
+
+function os.network.httpRequest(url, postData, headers)
+  if internet then
+    return internet.request(url, postData, headers)
+  end
+  return nil, "No internet card"
+end
+
+function os.network.tunnelSend(...)
+  if tunnel then
+    return tunnel.send(...)
+  end
+  return false
+end
+
+-- ==================== TAPE DRIVE MODULE ====================
+os.tape = {}
+
+os.tape.tapes = {}  -- Drive letter assignments for tapes
+os.tape.currentTape = nil
+
+-- TapeFS - Filesystem layer for tapes
+os.tape.BLOCK_SIZE = 512
+os.tape.MAGIC = "TAPEFS10"  -- Magic number for formatted tapes
+
+function os.tape.formatTape(proxy)
+  if not proxy then return false, "No tape drive" end
+  
+  local size = proxy.getSize()
+  if size == 0 then return false, "No tape inserted" end
+  
+  -- Create filesystem structure
+  local fs = {
+    magic = os.tape.MAGIC,
+    blockSize = os.tape.BLOCK_SIZE,
+    totalBlocks = math.floor(size / os.tape.BLOCK_SIZE),
+    usedBlocks = 2,  -- Header + root directory
+    files = {},
+    nextFileId = 1
+  }
+  
+  -- Write header to tape
+  local header = os.serialize(fs)
+  proxy.seek(-size)  -- Seek to beginning
+  proxy.write(header)
+  
+  -- Pad to block size
+  local padding = os.tape.BLOCK_SIZE - (#header % os.tape.BLOCK_SIZE)
+  if padding < os.tape.BLOCK_SIZE then
+    proxy.write(string.rep("\0", padding))
+  end
+  
+  return true
+end
+
+function os.tape.readTapeFS(proxy)
+  if not proxy then return nil end
+  
+  local size = proxy.getSize()
+  if size == 0 then return nil end
+  
+  proxy.seek(-size)  -- Seek to beginning
+  local headerData = proxy.read(os.tape.BLOCK_SIZE)
+  
+  if not headerData or #headerData == 0 then return nil end
+  
+  -- Parse header
+  local cleanData = headerData:match("^(.-)%z*$") or headerData
+  local func, err = load("return " .. cleanData, "=tapefs", "t", {})
+  if not func then return nil end
+  
+  local ok, fs = pcall(func)
+  if not ok or not fs or fs.magic ~= os.tape.MAGIC then
+    return nil
+  end
+  
+  return fs
+end
+
+function os.tape.writeTapeFS(proxy, fs)
+  if not proxy or not fs then return false end
+  
+  local header = os.serialize(fs)
+  proxy.seek(-proxy.getSize())
+  proxy.write(header)
+  
+  -- Pad to block size
+  local padding = os.tape.BLOCK_SIZE - (#header % os.tape.BLOCK_SIZE)
+  if padding < os.tape.BLOCK_SIZE then
+    proxy.write(string.rep("\0", padding))
+  end
+  
+  return true
+end
+
+-- Create a filesystem-like proxy for a tape
+function os.tape.createTapeProxy(tapeProxy)
+  local proxy = {}
+  proxy.address = tapeProxy.address
+  proxy.type = "tapefs"
+  proxy._tape = tapeProxy
+  
+  function proxy.spaceTotal()
+    return tapeProxy.getSize()
+  end
+  
+  function proxy.spaceUsed()
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return 0 end
+    return fs.usedBlocks * os.tape.BLOCK_SIZE
+  end
+  
+  function proxy.exists(path)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return false end
+    
+    for _, file in pairs(fs.files) do
+      if file.path == path then
+        return true
+      end
+    end
+    return false
+  end
+  
+  function proxy.isDirectory(path)
+    if path == "/" then return true end
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return false end
+    
+    for _, file in pairs(fs.files) do
+      if file.path == path and file.isDir then
+        return true
+      end
+    end
+    return false
+  end
+  
+  function proxy.list(path)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return function() end end
+    
+    path = path or "/"
+    local results = {}
+    local seen = {}
+    
+    for _, file in pairs(fs.files) do
+      if file.path:sub(1, #path) == path then
+        local rest = file.path:sub(#path + 1)
+        if rest:sub(1, 1) == "/" then rest = rest:sub(2) end
+        
+        local nextSlash = rest:find("/")
+        local name = nextSlash and rest:sub(1, nextSlash - 1) or rest
+        
+        if name ~= "" and not seen[name] then
+          seen[name] = true
+          table.insert(results, name)
+        end
+      end
+    end
+    
+    local i = 0
+    return function()
+      i = i + 1
+      return results[i]
+    end
+  end
+  
+  function proxy.size(path)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return 0 end
+    
+    for _, file in pairs(fs.files) do
+      if file.path == path then
+        return file.size or 0
+      end
+    end
+    return 0
+  end
+  
+  function proxy.open(path, mode)
+    mode = mode or "r"
+    local fs = os.tape.readTapeFS(tapeProxy)
+    
+    if mode == "r" then
+      if not fs then return nil end
+      
+      for id, file in pairs(fs.files) do
+        if file.path == path then
+          -- Read file data from tape
+          tapeProxy.seek(-tapeProxy.getSize() + file.offset)
+          local data = tapeProxy.read(file.size)
+          
+          return {
+            _data = data,
+            _pos = 0,
+            _closed = false,
+            _path = path
+          }
+        end
+      end
+      return nil
+    elseif mode == "w" then
+      if not fs then
+        os.tape.formatTape(tapeProxy)
+        fs = os.tape.readTapeFS(tapeProxy)
+      end
+      
+      -- Create new file entry
+      local handle = {
+        _data = "",
+        _pos = 0,
+        _closed = false,
+        _path = path,
+        _fs = fs,
+        _tape = tapeProxy,
+        _write = true
+      }
+      
+      return handle
+    end
+    
+    return nil
+  end
+  
+  function proxy.close(handle)
+    if handle._closed then return true end
+    handle._closed = true
+    
+    if handle._write then
+      -- Write file to tape
+      local fs = handle._fs
+      local fileId = fs.nextFileId
+      fs.nextFileId = fs.nextFileId + 1
+      
+      -- Remove old version if exists
+      for id, file in pairs(fs.files) do
+        if file.path == handle._path then
+          fs.files[id] = nil
+          fs.usedBlocks = fs.usedBlocks - math.ceil(file.size / os.tape.BLOCK_SIZE)
+          break
+        end
+      end
+      
+      -- Calculate offset (after header and existing files)
+      local offset = os.tape.BLOCK_SIZE
+      for _, file in pairs(fs.files) do
+        local fileEnd = file.offset + file.size
+        if fileEnd > offset then
+          offset = fileEnd
+        end
+      end
+      
+      -- Align to block
+      offset = math.ceil(offset / os.tape.BLOCK_SIZE) * os.tape.BLOCK_SIZE
+      
+      -- Add file entry
+      fs.files[fileId] = {
+        path = handle._path,
+        size = #handle._data,
+        offset = offset,
+        isDir = false
+      }
+      
+      fs.usedBlocks = fs.usedBlocks + math.ceil(#handle._data / os.tape.BLOCK_SIZE)
+      
+      -- Write file data
+      handle._tape.seek(-handle._tape.getSize() + offset)
+      handle._tape.write(handle._data)
+      
+      -- Update filesystem header
+      os.tape.writeTapeFS(handle._tape, fs)
+    end
+    
+    return true
+  end
+  
+  function proxy.read(handle, count)
+    if handle._closed then return nil end
+    count = count or math.huge
+    
+    if handle._pos >= #handle._data then
+      return nil
+    end
+    
+    local data = handle._data:sub(handle._pos + 1, handle._pos + count)
+    handle._pos = handle._pos + #data
+    return data
+  end
+  
+  function proxy.write(handle, data)
+    if handle._closed or not handle._write then return false end
+    handle._data = handle._data .. data
+    return true
+  end
+  
+  function proxy.remove(path)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return false end
+    
+    for id, file in pairs(fs.files) do
+      if file.path == path then
+        fs.files[id] = nil
+        fs.usedBlocks = fs.usedBlocks - math.ceil(file.size / os.tape.BLOCK_SIZE)
+        os.tape.writeTapeFS(tapeProxy, fs)
+        return true
+      end
+    end
+    
+    return false
+  end
+  
+  function proxy.makeDirectory(path)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then
+      os.tape.formatTape(tapeProxy)
+      fs = os.tape.readTapeFS(tapeProxy)
+    end
+    
+    local fileId = fs.nextFileId
+    fs.nextFileId = fs.nextFileId + 1
+    
+    fs.files[fileId] = {
+      path = path,
+      size = 0,
+      offset = 0,
+      isDir = true
+    }
+    
+    os.tape.writeTapeFS(tapeProxy, fs)
+    return true
+  end
+  
+  function proxy.rename(from, to)
+    local fs = os.tape.readTapeFS(tapeProxy)
+    if not fs then return false end
+    
+    for _, file in pairs(fs.files) do
+      if file.path == from then
+        file.path = to
+        os.tape.writeTapeFS(tapeProxy, fs)
+        return true
+      end
+    end
+    
+    return false
+  end
+  
+  function proxy.lastModified(path)
+    return 0
+  end
+  
+  function proxy.getLabel()
+    return "TapeFS"
+  end
+  
+  function proxy.setLabel(label)
+    return label
+  end
+  
+  return proxy
+end
+
+function os.tape.setTape(letter, address)
+  letter = string.upper(letter)
+  if address then
+    local tapeProxy = component.proxy(address)
+    if tapeProxy and tapeProxy.type == "tape_drive" then
+      -- Create filesystem proxy wrapper
+      local fsProxy = os.tape.createTapeProxy(tapeProxy)
+      os.tape.tapes[letter] = tapeProxy
+      
+      -- Also register as a filesystem drive
+      os.fs.drives[letter] = fsProxy
+      
+      os.tape.saveTapeConfig()
+      return true
+    end
+    return false, "Invalid tape drive address"
+  else
+    os.tape.tapes[letter] = nil
+    os.fs.drives[letter] = nil
+    os.tape.saveTapeConfig()
+    return true
+  end
+end
+
+function os.tape.saveTapeConfig()
+  local config = {}
+  for letter, proxy in pairs(os.tape.tapes) do
+    config[letter] = proxy.address
+  end
+  local data = "return " .. os.serialize(config)
+  local handle = bootfs.open("TAPES.CFG", "w")
+  if handle then
+    bootfs.write(handle, data)
+    bootfs.close(handle)
+  end
+end
+
+function os.tape.loadTapeConfig()
+  if bootfs.exists("TAPES.CFG") then
+    local handle = bootfs.open("TAPES.CFG", "r")
+    if handle then
+      local data = ""
+      repeat
+        local chunk = bootfs.read(handle, math.huge)
+        data = data .. (chunk or "")
+      until not chunk
+      bootfs.close(handle)
+      
+      local func, err = load(data, "=TAPES.CFG", "t", {})
+      if func then
+        local ok, config = pcall(func)
+        if ok and type(config) == "table" then
+          for letter, address in pairs(config) do
+            os.tape.setTape(letter, address)
+          end
+        end
+      end
+    end
+  end
+end
+
+function os.tape.getTape(letter)
+  letter = string.upper(letter)
+  return os.tape.tapes[letter]
+end
+
+function os.tape.listTapes()
+  local list = {}
+  for letter, proxy in pairs(os.tape.tapes) do
+    table.insert(list, {letter = letter, address = proxy.address})
+  end
+  return list
+end
+
+function os.tape.setCurrentTape(letter)
+  letter = string.upper(letter)
+  if os.tape.tapes[letter] then
+    os.tape.currentTape = letter
+    os.tape.drive = os.tape.tapes[letter]
+    return true
+  end
+  return false, "Tape not found"
+end
+
+function os.tape.getCurrentTape()
+  return os.tape.currentTape
+end
+
+local tape = os.component.getPrimary("tape_drive")
+os.tape.drive = tape
+
+function os.tape.play()
+  if tape then
+    return tape.play()
+  end
+end
+
+function os.tape.stop()
+  if tape then
+    return tape.stop()
+  end
+end
+
+function os.tape.pause()
+  if tape then
+    return tape.stop()
+  end
+end
+
+function os.tape.seek(position)
+  if tape then
+    return tape.seek(position)
+  end
+end
+
+function os.tape.read(count)
+  if tape then
+    return tape.read(count or 8192)
+  end
+end
+
+function os.tape.write(data)
+  if tape then
+    return tape.write(data)
+  end
+end
+
+function os.tape.getSize()
+  if tape then
+    return tape.getSize()
+  end
+  return 0
+end
+
+function os.tape.getState()
+  if tape then
+    return tape.getState()
+  end
+  return "STOPPED"
+end
+
+function os.tape.getPosition()
+  if tape then
+    return tape.getPosition()
+  end
+  return 0
+end
+
+function os.tape.setSpeed(speed)
+  if tape then
+    return tape.setSpeed(speed)
+  end
+end
+
+function os.tape.setVolume(volume)
+  if tape then
+    return tape.setVolume(volume)
+  end
+end
+
+-- ==================== SOUND CARD MODULE ====================
+os.sound = {}
+
+local sound = os.component.getPrimary("sound")
+os.sound.card = sound
+
+function os.sound.setWave(channel, wave)
+  if sound then
+    return sound.setWave(channel, wave)
+  end
+end
+
+function os.sound.setFrequency(channel, freq)
+  if sound then
+    return sound.setFrequency(channel, freq)
+  end
+end
+
+function os.sound.open(channel)
+  if sound then
+    return sound.open(channel)
+  end
+end
+
+function os.sound.close(channel)
+  if sound then
+    return sound.close(channel)
+  end
+end
+
+function os.sound.setVolume(channel, volume)
+  if sound then
+    return sound.setVolume(channel, volume)
+  end
+end
+
+function os.sound.setDelay(delay)
+  if sound then
+    return sound.setDelay(delay)
+  end
+end
+
+function os.sound.process()
+  if sound then
+    return sound.process()
+  end
+end
+
+function os.sound.beep(frequency, duration)
+  if sound then
+    os.sound.setWave(1, os.sound.modes.square)
+    os.sound.open(1)
+    os.sound.setFrequency(1, frequency or 1000)
+    os.sound.setVolume(1, 1.0)
+    computer.pullSignal(duration or 0.2)
+    os.sound.close(1)
+  end
+end
+
+os.sound.modes = {
+  sine = 1,
+  square = 2,
+  triangle = 3,
+  sawtooth = 4,
+}
+
+-- ==================== EVENT/SIGNAL MODULE ====================
+os.event = {}
+
+function os.event.pull(timeout, filter)
+  local deadline = computer.uptime() + (timeout or math.huge)
+  repeat
+    local signal = table.pack(computer.pullSignal(deadline - computer.uptime()))
+    if signal.n > 0 then
+      -- Update modifier key states for keyboard events
+      if signal[1] == "key_down" or signal[1] == "key_up" then
+        os.keyboard._updateModifiers(signal[1], signal[4])
+      end
+      
+      if not filter or signal[1] == filter then
+        return table.unpack(signal, 1, signal.n)
+      end
+    end
+  until computer.uptime() >= deadline
+  return nil
+end
+
+function os.event.push(...)
+  return computer.pushSignal(...)
+end
+
+-- ==================== SYSTEM UTILITIES ====================
+os.system = {}
+
+function os.system.shutdown(reboot)
+  if reboot then
+    computer.shutdown(true)
+  else
+    computer.shutdown()
+  end
+end
+
+function os.system.uptime()
+  return computer.uptime()
+end
+
+function os.system.freeMemory()
+  return computer.freeMemory()
+end
+
+function os.system.totalMemory()
+  return computer.totalMemory()
+end
+
+function os.system.energy()
+  return computer.energy()
+end
+
+function os.system.maxEnergy()
+  return computer.maxEnergy()
+end
+
+function os.system.sleep(seconds)
+  local deadline = computer.uptime() + (seconds or 0)
+  repeat
+    computer.pullSignal(deadline - computer.uptime())
+  until computer.uptime() >= deadline
+end
+
+function os.system.beep(frequency, duration)
+  computer.beep(frequency, duration)
+end
+
+-- ==================== STRING UTILITIES ====================
+os.string = {}
+
+function os.string.split(str, sep)
+  local parts = {}
+  local pattern = string.format("([^%s]+)", sep or " ")
+  for part in string.gmatch(str, pattern) do
+    table.insert(parts, part)
+  end
+  return parts
+end
+
+function os.string.trim(str)
+  return string.match(str, "^%s*(.-)%s*$")
+end
+
+function os.string.startsWith(str, prefix)
+  return string.sub(str, 1, #prefix) == prefix
+end
+
+function os.string.endsWith(str, suffix)
+  return string.sub(str, -#suffix) == suffix
+end
+
+-- ==================== SERIALIZATION ====================
+function os.serialize(value, indent)
+  indent = indent or 0
+  local t = type(value)
+  
+  if t == "number" or t == "boolean" then
+    return tostring(value)
+  elseif t == "string" then
+    return string.format("%q", value)
+  elseif t == "table" then
+    local parts = {}
+    local spaces = string.rep("  ", indent)
+    table.insert(parts, "{")
+    for k, v in pairs(value) do
+      local key
+      if type(k) == "string" and k:match("^[%a_][%w_]*$") then
+        key = k
+      else
+        key = "[" .. os.serialize(k) .. "]"
+      end
+      table.insert(parts, spaces .. "  " .. key .. " = " .. os.serialize(v, indent + 1) .. ",")
+    end
+    table.insert(parts, spaces .. "}")
+    return table.concat(parts, "\n")
+  else
+    return "nil"
+  end
+end
+
+-- ==================== PATH UTILITIES ====================
+os.path = {}
+
+function os.path.concat(...)
+  local parts = {...}
+  local result = ""
+  for i, part in ipairs(parts) do
+    if part ~= "" then
+      if result ~= "" and not result:match("/$") then
+        result = result .. "/"
+      end
+      result = result .. part
+    end
+  end
+  return result
+end
+
+function os.path.split(path)
+  local dir, file = path:match("^(.+)/([^/]+)$")
+  if not dir then
+    return "/", path
+  end
+  return dir, file
+end
+
+function os.path.name(path)
+  return path:match("[^/]+$") or path
+end
+
+function os.path.extension(path)
+  return path:match("%.([^./]+)$") or ""
+end
+
+-- Initialize system
+if gpu then
+  gpu.set(1, 1, "OS.SYS loaded successfully")
+end
+
+-- Load saved drive configurations
+os.fs.loadDriveConfig()
+os.tape.loadTapeConfig()
+
+return true
